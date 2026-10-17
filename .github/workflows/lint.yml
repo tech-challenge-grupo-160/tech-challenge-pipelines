@@ -1,0 +1,26 @@
+# Valida os workflows deste repositorio com o actionlint: sintaxe, expressoes
+# ${{ }}, inputs do workflow_call e scripts de shell (via shellcheck). Um erro
+# aqui quebraria o pipeline dos tres servicos ao mesmo tempo.
+name: Lint
+
+on:
+  pull_request:
+    branches: [develop, homolog, main]
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: Lint dos workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.7 -color

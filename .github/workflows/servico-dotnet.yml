@@ -1,0 +1,397 @@
+# Pipeline de CI/CD dos microsservicos .NET da oficina mecanica (F4-08).
+#
+# Cada servico chama este workflow com os proprios parametros, a partir do
+# proprio repositorio:
+#
+#   jobs:
+#     pipeline:
+#       uses: tech-challenge-grupo-160/tech-challenge-pipelines/.github/workflows/servico-dotnet.yml@v1
+#       with:
+#         servico: oficina-mecanica-billing
+#         solucao: Fiap.TechChallenge.OficinaMecanica.Billing.slnx
+#         imagem: billing
+#         ambiente: ...
+#       secrets: inherit
+#
+# Dois jobs:
+#
+#   ci      build, testes com cobertura e build da imagem. Roda sempre e e o
+#           check obrigatorio dos rulesets ("<job do chamador> / Build and tests").
+#   deploy  imagem no ECR e deploy no EKS. So roda quando `ambiente` vem
+#           preenchido, e so depois do ci passar: teste vermelho nao publica.
+#
+# Nasceu do deploy-eks.yml do tech-challenge-oficina-mecanica (F3-18); os
+# comentarios sobre o porque de cada passo foram mantidos.
+
+name: Servico .NET
+
+on:
+  workflow_call:
+    inputs:
+      servico:
+        description: "Nome do servico no Kubernetes e no Datadog (ex.: oficina-mecanica-billing)."
+        type: string
+        required: true
+      solucao:
+        description: "Arquivo .slnx/.sln na raiz do repositorio."
+        type: string
+        required: true
+      imagem:
+        description: "Sufixo do repositorio no ECR: tc-grupo160-<ambiente>-<imagem>."
+        type: string
+        required: true
+      ambiente:
+        description: "desenvolvimento, homologacao ou producao. Vazio = so CI, sem deploy."
+        type: string
+        default: ""
+      dockerfile:
+        type: string
+        default: docker/backend/Dockerfile
+      runsettings:
+        description: "Configuracao do coverlet. Vazio = sem arquivo de configuracao."
+        type: string
+        default: coverlet.runsettings
+      dotnet_version:
+        type: string
+        default: "10.0.x"
+      regiao_aws:
+        type: string
+        default: us-east-1
+      namespace:
+        type: string
+        default: oficina-mecanica
+      deployment:
+        description: "Nome do Deployment. Vazio = mesmo nome do servico."
+        type: string
+        default: ""
+      manifestos_repositorio:
+        description: "Repositorio dos manifests. Vazio = o proprio repositorio do servico."
+        type: string
+        default: ""
+      manifestos_ref:
+        description: "Branch ou tag dos manifests quando vem de outro repositorio."
+        type: string
+        default: develop
+      manifestos_caminho:
+        description: "Pasta com o kustomization.yaml."
+        type: string
+        default: k8s
+      segredos:
+        description: >-
+          Um por linha, CHAVE=id-do-segredo ou CHAVE=id-do-segredo#campo-json.
+          `{sufixo}` vira dev, hom ou prod. Vazio = nenhum Secret.
+        type: string
+        default: ""
+      nome_secret:
+        description: "Nome do Secret do Kubernetes. Vazio = <servico>-secret."
+        type: string
+        default: ""
+      cluster_autoscaler:
+        description: "Aplica o Cluster Autoscaler do tech-challenge-infra-k8s antes do deploy."
+        type: boolean
+        default: false
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_SESSION_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      - name: Restore
+        run: dotnet restore "${{ inputs.solucao }}"
+
+      - name: Build
+        run: dotnet build "${{ inputs.solucao }}" --configuration Release --no-restore
+
+      # Unitarios e de integracao juntos: o runner tem Docker, entao testes com
+      # Testcontainers funcionam sem passo extra.
+      - name: Testes com cobertura
+        env:
+          RUNSETTINGS: ${{ inputs.runsettings }}
+        run: |
+          ARGS=()
+          if [ -n "$RUNSETTINGS" ]; then ARGS=(--settings "$RUNSETTINGS"); fi
+          dotnet test "${{ inputs.solucao }}" \
+            --configuration Release --no-build --no-restore --verbosity normal \
+            --collect:"XPlat Code Coverage" "${ARGS[@]}" \
+            --logger trx --results-directory TestResults
+
+      # Quality gate (SonarCloud) entra aqui na F4-09: mesmo job, antes do
+      # upload, para que um gate reprovado tambem bloqueie o deploy.
+
+      - name: Resumo da cobertura
+        if: always()
+        run: |
+          shopt -s globstar nullglob
+          arquivos=(TestResults/**/coverage.cobertura.xml)
+          {
+            echo "### Cobertura de linhas - ${{ inputs.servico }}"
+            echo ""
+            echo "| Relatorio | Linhas |"
+            echo "|---|---|"
+            for f in "${arquivos[@]}"; do
+              taxa="$(grep -o 'line-rate="[0-9.]*"' "$f" | head -1 | grep -o '[0-9.]*')"
+              echo "| \`${f#TestResults/}\` | $(awk -v t="$taxa" 'BEGIN { printf "%.1f%%", t * 100 }') |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar resultados dos testes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: error
+
+      - name: Publicar cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-results
+          path: TestResults/**/coverage.cobertura.xml
+          if-no-files-found: error
+
+      # Sem deploy, a imagem ainda precisa ser validada: um Dockerfile quebrado
+      # so apareceria no primeiro deploy. Com deploy, o job seguinte ja constroi.
+      - name: Build da imagem
+        if: inputs.ambiente == ''
+        run: docker build -f "${{ inputs.dockerfile }}" -t "${{ inputs.servico }}:ci" .
+
+  deploy:
+    name: Deploy
+    needs: ci
+    if: inputs.ambiente != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ inputs.ambiente }}
+    env:
+      NAMESPACE: ${{ inputs.namespace }}
+      DEPLOYMENT: ${{ inputs.deployment || inputs.servico }}
+      REGIAO: ${{ inputs.regiao_aws }}
+
+    steps:
+      - name: Checkout do servico
+        uses: actions/checkout@v4
+
+      - name: Checkout dos manifests
+        if: inputs.manifestos_repositorio != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.manifestos_repositorio }}
+          ref: ${{ inputs.manifestos_ref }}
+          path: .manifestos
+
+      - name: Checkout do Cluster Autoscaler
+        if: inputs.cluster_autoscaler
+        uses: actions/checkout@v4
+        with:
+          repository: tech-challenge-grupo-160/tech-challenge-infra-k8s
+          ref: develop
+          path: .infra-k8s
+
+      # Sem credencial nao ha deploy: falhar e o comportamento correto.
+      - name: Exige credenciais da sessao
+        env:
+          KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::Sem credenciais da AWS. Rode scripts/renova-secrets.sh no tech-challenge-oficina-mecanica."
+            exit 1
+          fi
+
+      - name: Autenticar na AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ inputs.regiao_aws }}
+
+      # O sufixo casa com var.ambiente do Terraform. Divergir aqui aponta o
+      # deploy para um cluster ou um segredo de outro ambiente.
+      - name: Resolver ambiente
+        id: amb
+        env:
+          AMBIENTE: ${{ inputs.ambiente }}
+          MANIFESTOS: ${{ inputs.manifestos_repositorio != '' && format('.manifestos/{0}', inputs.manifestos_caminho) || inputs.manifestos_caminho }}
+        run: |
+          case "$AMBIENTE" in
+            desenvolvimento) SUFIXO="dev" ;;
+            homologacao)     SUFIXO="hom" ;;
+            producao)        SUFIXO="prod" ;;
+            *) echo "::error::Ambiente invalido: '$AMBIENTE'."; exit 1 ;;
+          esac
+          # O id da conta vem em runtime: os repositorios sao publicos.
+          CONTA="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${CONTA}.dkr.ecr.${REGIAO}.amazonaws.com"
+
+          {
+            echo "sufixo=${SUFIXO}"
+            echo "cluster=tc-grupo160-${SUFIXO}"
+            echo "registry=${REGISTRY}"
+            echo "repositorio=tc-grupo160-${SUFIXO}-${{ inputs.imagem }}"
+            echo "imagem=${REGISTRY}/tc-grupo160-${SUFIXO}-${{ inputs.imagem }}"
+            echo "manifestos=${MANIFESTOS}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Ambiente: $AMBIENTE  Cluster: tc-grupo160-${SUFIXO}  Servico: ${{ inputs.servico }}"
+
+      # Falha cedo e com mensagem clara. Sem isto, a ausencia do cluster so
+      # apareceria no update-kubeconfig, com erro generico de AccessDenied.
+      - name: Conferir que o cluster e o ECR existem
+        run: |
+          if ! aws eks describe-cluster --name "${{ steps.amb.outputs.cluster }}" >/dev/null 2>&1; then
+            echo "::error::Cluster ${{ steps.amb.outputs.cluster }} nao existe. Suba o ambiente com o sobe-tudo.sh ou ligue criar_cluster no tech-challenge-infra-k8s."
+            exit 1
+          fi
+          if ! aws ecr describe-repositories --repository-names "${{ steps.amb.outputs.repositorio }}" >/dev/null 2>&1; then
+            echo "::error::Repositorio ${{ steps.amb.outputs.repositorio }} nao existe no ECR. Ele e criado pelo Terraform do tech-challenge-infra-k8s (infra/ecr.tf)."
+            exit 1
+          fi
+
+      - name: Login no ECR
+        run: |
+          aws ecr get-login-password --region "$REGIAO" \
+            | docker login --username AWS --password-stdin "${{ steps.amb.outputs.registry }}"
+
+      # Duas tags: o SHA, que e o que o rollback usa, e `latest` por conveniencia
+      # de inspecao. O deploy referencia sempre o SHA - `latest` num Deployment
+      # torna impossivel saber o que esta rodando.
+      - name: Build e push da imagem
+        run: |
+          IMAGEM="${{ steps.amb.outputs.imagem }}"
+          SHA="${GITHUB_SHA::12}"
+          docker build -f "${{ inputs.dockerfile }}" -t "${IMAGEM}:${SHA}" -t "${IMAGEM}:latest" .
+          docker push "${IMAGEM}:${SHA}"
+          docker push "${IMAGEM}:latest"
+
+      - name: Gerar kubeconfig
+        run: aws eks update-kubeconfig --region "$REGIAO" --name "${{ steps.amb.outputs.cluster }}"
+
+      # Componente do cluster, nao da aplicacao: vive em kube-system. Sem o
+      # autoscaler o HPA escala pod ate acabar o espaco nos nodes e para de
+      # escalar. So o servico que o chamador indicar aplica (hoje o OS Service).
+      - name: Aplicar o Cluster Autoscaler
+        if: inputs.cluster_autoscaler
+        working-directory: .infra-k8s/k8s/cluster-autoscaler
+        run: |
+          CLUSTER="${{ steps.amb.outputs.cluster }}"
+          sed -i "s|__CLUSTER__|${CLUSTER}|g; s|__REGIAO__|${REGIAO}|g" deployment.yaml
+
+          # Um placeholder que sobrevive vira um autoscaler que nao descobre
+          # node group nenhum e fica rodando sem fazer nada - falha silenciosa.
+          if ! grep -q "k8s.io/cluster-autoscaler/${CLUSTER}" deployment.yaml; then
+            echo "::error::Placeholder __CLUSTER__ nao foi substituido no manifest do autoscaler."
+            exit 1
+          fi
+
+          kubectl apply -k .
+          kubectl rollout status deployment/cluster-autoscaler --namespace kube-system --timeout=180s
+
+      - name: Criar namespace
+        run: |
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml \
+            | kubectl label --local -f - app.kubernetes.io/part-of=oficina-mecanica -o yaml \
+            | kubectl apply -f -
+
+      # O Secret e montado a partir do Secrets Manager a cada deploy, nunca
+      # versionado. Os valores sao mascarados no log antes de qualquer uso: sem
+      # isto, um erro de kubectl poderia ecoar a senha do banco.
+      - name: Sincronizar Secret com o Secrets Manager
+        if: inputs.segredos != ''
+        env:
+          SEGREDOS: ${{ inputs.segredos }}
+          NOME_SECRET: ${{ inputs.nome_secret || format('{0}-secret', inputs.servico) }}
+          SUFIXO: ${{ steps.amb.outputs.sufixo }}
+        run: |
+          ARGS=()
+          while IFS= read -r linha; do
+            linha="$(echo "$linha" | xargs)"
+            [ -z "$linha" ] && continue
+            CHAVE="${linha%%=*}"
+            ORIGEM="${linha#*=}"
+            ORIGEM="${ORIGEM//\{sufixo\}/$SUFIXO}"
+            ID="${ORIGEM%%#*}"
+            CAMPO=""
+            [ "$ID" != "$ORIGEM" ] && CAMPO="${ORIGEM#*#}"
+
+            VALOR="$(aws secretsmanager get-secret-value --secret-id "$ID" --query SecretString --output text)"
+            if [ -n "$CAMPO" ]; then VALOR="$(echo "$VALOR" | jq -r --arg c "$CAMPO" '.[$c]')"; fi
+            echo "::add-mask::$VALOR"
+
+            if [ -z "$VALOR" ] || [ "$VALOR" = "null" ]; then
+              echo "::error::$CHAVE vazio: segredo $ID${CAMPO:+ (campo $CAMPO)}."
+              exit 1
+            fi
+            ARGS+=(--from-literal="${CHAVE}=${VALOR}")
+          done <<< "$SEGREDOS"
+
+          kubectl create secret generic "$NOME_SECRET" --namespace "$NAMESPACE" \
+            "${ARGS[@]}" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Aplicar manifests
+        working-directory: ${{ steps.amb.outputs.manifestos }}
+        run: |
+          # `kustomize edit set image` exigiria o binario proprio do kustomize;
+          # o kubectl ja embute o motor, entao a substituicao e feita no arquivo.
+          sed -i "s|newTag: .*|newTag: ${GITHUB_SHA::12}|" kustomization.yaml
+          sed -i "s|newName: .*|newName: ${{ steps.amb.outputs.imagem }}|" kustomization.yaml
+          # DD_ENV (unified service tagging) usa o mesmo sufixo do ambiente.
+          grep -rl "__AMBIENTE__" . | xargs -r sed -i "s|__AMBIENTE__|${{ steps.amb.outputs.sufixo }}|g"
+          kubectl apply -k .
+
+      - name: Aguardar rollout
+        run: kubectl rollout status "deployment/$DEPLOYMENT" --namespace "$NAMESPACE" --timeout=300s
+
+      - name: Estado do namespace
+        if: always()
+        run: kubectl get all --namespace "$NAMESPACE" || true
+
+      # Diagnostico util quando o rollout falha: sem isto so restaria o
+      # "timed out waiting for the condition", sem dizer por que.
+      - name: Logs do servico quando falha
+        if: failure()
+        run: |
+          kubectl describe pods --namespace "$NAMESPACE" --selector "app=$DEPLOYMENT" | tail -40 || true
+          kubectl logs --namespace "$NAMESPACE" --selector "app=$DEPLOYMENT" --tail=120 --all-containers || true
+
+      - name: Resumo
+        if: always()
+        run: |
+          {
+            echo "### Deploy no EKS - ${{ inputs.servico }}"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Ambiente | ${{ inputs.ambiente }} |"
+            echo "| Cluster | \`${{ steps.amb.outputs.cluster }}\` |"
+            echo "| Imagem | \`${{ steps.amb.outputs.repositorio }}:${GITHUB_SHA::12}\` |"
+            echo "| Namespace | \`$NAMESPACE\` |"
+            echo ""
+            echo "#### Rollback"
+            echo ""
+            echo '```bash'
+            echo "kubectl rollout undo deployment/$DEPLOYMENT -n $NAMESPACE"
+            echo "kubectl set image deployment/$DEPLOYMENT api=${{ steps.amb.outputs.imagem }}:<sha> -n $NAMESPACE"
+            echo '```'
+            echo ""
+            echo "Tags disponiveis: \`aws ecr list-images --repository-name ${{ steps.amb.outputs.repositorio }}\` (o lifecycle guarda as 10 mais recentes)."
+          } >> "$GITHUB_STEP_SUMMARY"
