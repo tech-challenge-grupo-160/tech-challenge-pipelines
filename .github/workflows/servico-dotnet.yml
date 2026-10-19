@@ -15,8 +15,9 @@
 #
 # Dois jobs:
 #
-#   ci      build, testes com cobertura e build da imagem. Roda sempre e e o
-#           check obrigatorio dos rulesets ("<job do chamador> / Build and tests").
+#   ci      build, testes com cobertura, quality gate do SonarCloud e build da
+#           imagem. Roda sempre e e o check obrigatorio dos rulesets
+#           ("<job do chamador> / Build and tests").
 #   deploy  imagem no ECR e deploy no EKS. So roda quando `ambiente` vem
 #           preenchido, e so depois do ci passar: teste vermelho nao publica.
 #
@@ -90,12 +91,26 @@ on:
         description: "Aplica o Cluster Autoscaler do tech-challenge-infra-k8s antes do deploy."
         type: boolean
         default: false
+      sonar_organizacao:
+        description: "Organizacao no SonarCloud. Vazio = dono do repositorio."
+        type: string
+        default: ""
+      sonar_projeto:
+        description: "Chave do projeto no SonarCloud. Vazio = <dono>_<repositorio>, o padrao da importacao."
+        type: string
+        default: ""
+      sonar_exclusoes:
+        description: "Padroes fora da analise, separados por virgula (ex.: codigo gerado como **/Migrations/**)."
+        type: string
+        default: ""
     secrets:
       AWS_ACCESS_KEY_ID:
         required: false
       AWS_SECRET_ACCESS_KEY:
         required: false
       AWS_SESSION_TOKEN:
+        required: false
+      SONAR_TOKEN:
         required: false
 
 permissions:
@@ -108,13 +123,61 @@ jobs:
     timeout-minutes: 25
 
     steps:
+      # Historico completo: o SonarCloud usa o blame para separar codigo novo.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ inputs.dotnet_version }}
+
+      # Sem o token a analise e pulada com aviso, em vez de quebrar o pipeline:
+      # e assim que um servico novo funciona antes de existir no SonarCloud.
+      - name: Verificar SonarCloud
+        id: sonar
+        env:
+          TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "ativo=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ativo=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SONAR_TOKEN nao configurado neste repositorio: analise do SonarCloud e quality gate pulados."
+          fi
+
+      - name: Setup Java (SonarScanner)
+        if: steps.sonar.outputs.ativo == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # O begin precisa vir antes do build: o scanner se pendura no MSBuild.
+      # qualitygate.wait faz o end falhar quando o gate reprova, e a falha
+      # derruba este job - que e o check obrigatorio e o pre-requisito do deploy.
+      - name: Iniciar analise do SonarCloud
+        if: steps.sonar.outputs.ativo == 'true'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          ORGANIZACAO: ${{ inputs.sonar_organizacao || github.repository_owner }}
+          PROJETO: ${{ inputs.sonar_projeto || format('{0}_{1}', github.repository_owner, github.event.repository.name) }}
+          EXCLUSOES: ${{ inputs.sonar_exclusoes }}
+        run: |
+          dotnet tool install --global dotnet-sonarscanner
+          ARGS=()
+          if [ -n "$EXCLUSOES" ]; then ARGS=("/d:sonar.exclusions=$EXCLUSOES"); fi
+          dotnet sonarscanner begin \
+            /k:"$PROJETO" /o:"$ORGANIZACAO" \
+            /d:sonar.token="$SONAR_TOKEN" \
+            /d:sonar.host.url=https://sonarcloud.io \
+            /d:sonar.cs.opencover.reportsPaths="TestResults/**/coverage.opencover.xml" \
+            /d:sonar.cs.vstest.reportsPaths="TestResults/**/*.trx" \
+            /d:sonar.qualitygate.wait=true \
+            /d:sonar.qualitygate.timeout=300 \
+            "${ARGS[@]}"
 
       - name: Restore
         run: dotnet restore "${{ inputs.solucao }}"
@@ -123,7 +186,9 @@ jobs:
         run: dotnet build "${{ inputs.solucao }}" --configuration Release --no-restore
 
       # Unitarios e de integracao juntos: o runner tem Docker, entao testes com
-      # Testcontainers funcionam sem passo extra.
+      # Testcontainers funcionam sem passo extra. A cobertura sai em dois
+      # formatos: Cobertura para o resumo e os artefatos, OpenCover para o
+      # SonarCloud, cujo scanner .NET nao le Cobertura.
       - name: Testes com cobertura
         env:
           RUNSETTINGS: ${{ inputs.runsettings }}
@@ -133,10 +198,14 @@ jobs:
           dotnet test "${{ inputs.solucao }}" \
             --configuration Release --no-build --no-restore --verbosity normal \
             --collect:"XPlat Code Coverage" "${ARGS[@]}" \
-            --logger trx --results-directory TestResults
+            --logger trx --results-directory TestResults \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura,opencover
 
-      # Quality gate (SonarCloud) entra aqui na F4-09: mesmo job, antes do
-      # upload, para que um gate reprovado tambem bloqueie o deploy.
+      - name: Quality gate do SonarCloud
+        if: steps.sonar.outputs.ativo == 'true'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
 
       - name: Resumo da cobertura
         if: always()
