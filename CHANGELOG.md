@@ -4,6 +4,11 @@ Todas as mudancas notaveis deste repositorio serao documentadas neste arquivo.
 
 O formato segue [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 
+## [1.2.0] - 2026-11-15
+
+### Fixed
+- Analise e quality gate do SonarCloud so em PR e na branch padrao. O plano gratuito recusa as outras branches, e o push na homolog ou o disparo manual a partir da develop falhavam no gate e pulavam o deploy (F4-38, F4-42)
+
 ## [1.1.0] - 2026-10-17
 
 ### Added
