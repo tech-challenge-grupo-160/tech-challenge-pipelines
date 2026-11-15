@@ -136,16 +136,30 @@ jobs:
 
       # Sem o token a analise e pulada com aviso, em vez de quebrar o pipeline:
       # e assim que um servico novo funciona antes de existir no SonarCloud.
+      #
+      # So PR e a branch padrao sao analisados. O plano gratuito do SonarCloud
+      # recusa as demais branches ("Organization is not allowed to access data
+      # from non main branches"), e o push na homolog ou o disparo manual a
+      # partir da develop falhavam no gate sem nenhum problema no codigo,
+      # pulando o deploy (ensaio da F4-42, 15/11/2026). O codigo dessas branches
+      # chega por PR, e o gate ja rodou nele. Build e testes continuam
+      # obrigatorios em todo evento.
       - name: Verificar SonarCloud
         id: sonar
         env:
           TOKEN: ${{ secrets.SONAR_TOKEN }}
+          EVENTO: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          BRANCH_PADRAO: ${{ github.event.repository.default_branch }}
         run: |
-          if [ -n "$TOKEN" ]; then
+          if [ -z "$TOKEN" ]; then
+            echo "ativo=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SONAR_TOKEN nao configurado neste repositorio: analise do SonarCloud e quality gate pulados."
+          elif [ "$EVENTO" = "pull_request" ] || [ "$BRANCH" = "$BRANCH_PADRAO" ]; then
             echo "ativo=true" >> "$GITHUB_OUTPUT"
           else
             echo "ativo=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::SONAR_TOKEN nao configurado neste repositorio: analise do SonarCloud e quality gate pulados."
+            echo "::notice::SonarCloud analisa so PR e a branch padrao ($BRANCH_PADRAO) no plano gratuito. Em $BRANCH ($EVENTO) o quality gate ja rodou no PR que trouxe o codigo; build e testes seguem obrigatorios."
           fi
 
       - name: Setup Java (SonarScanner)
